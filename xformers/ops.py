@@ -6,7 +6,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional, Set, Type, Union
+from typing import Any, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 
 import torch
 
@@ -105,6 +105,12 @@ class AttentionOpBase(torch.autograd.Function):
 
     _TEST_BATCH_SIZES: List[int] = [1, 300]
     _TEST_K: List[int] = [32, 128]
+
+    @classmethod
+    def info(cls):
+        if cls.FORWARD_OPERATOR.__name__ == "no_such_operator":
+            return "not built"
+        return "available"
 
     @classmethod
     def bmhk2bmk_contiguous(cls, tensor) -> torch.Tensor:
@@ -388,6 +394,12 @@ class MemoryEfficientAttentionFlashAttentionOp(AttentionOpBase):
     NAME = "flshatt"
 
     @classmethod
+    def info(cls):
+        if not has_flashattention:
+            return "not built"
+        return "available - requires GPU with compute capability 7.5+"
+
+    @classmethod
     def supports(cls, d: "AttentionOpDispatch") -> bool:
         if not has_flashattention:
             return False
@@ -506,7 +518,29 @@ class MemoryEfficientAttentionFlashAttentionOp(AttentionOpBase):
         if rng_state is not None:
             cur_rng_state = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(rng_state)
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        # Create dq,dk,dv
+        # If Q/K/V come from a single QKV tensor, let's put the gradient in the
+        # right strides, so we can avoid a `cat`
+        if (
+            q.shape[0] == k.shape[0]
+            and q.shape[2] == v.shape[2]
+            and q.storage().data_ptr() == k.storage().data_ptr()
+            and q.storage().data_ptr() == v.storage().data_ptr()
+        ):
+            # Create one big contiguous chunk
+            # This is because q, k and v usually come from a single
+            # output of a linear layer that is chunked.
+            # Creating the gradients with the right layout saves us
+            # a `torch.cat` call in the backward pass
+            chunk = torch.empty(
+                (q.shape[0], 3, q.shape[1], q.shape[2]), dtype=q.dtype, device=q.device
+            )
+            dq = chunk.select(1, 0)
+            dk = chunk.select(1, 1)
+            dv = chunk.select(1, 2)
+        else:
+            dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
         assert grad.dtype in cls.SUPPORTED_DTYPES
         cls._flash_attn_backward(
             grad.reshape(ctx.kernel_output_shape),
@@ -653,6 +687,76 @@ class AttentionOpDispatch:
             kv_len=value.shape[-2],
             q_len=query.shape[-2],
         )
+
+
+def get_stack_strides(
+    tensors: Sequence[torch.Tensor], dim: int
+) -> Optional[Tuple[int, ...]]:
+    """
+    If the tensors are already stacked, returns the strides of the stacked
+    tensors. Otherwise returns None.
+    """
+    if len(tensors) <= 1 or dim > tensors[0].ndim:
+        return None
+
+    final_stride = []
+    for i in range(tensors[0].ndim + 1):
+        if i == dim:
+            final_stride.append(
+                tensors[1].storage_offset() - tensors[0].storage_offset()
+            )
+            continue
+        if i > dim:
+            i -= 1
+        final_stride.append(tensors[0].stride(i))
+
+    for i, x in enumerate(tensors):
+        # Sanity checks
+        if x.shape != tensors[0].shape:
+            return None
+        # Actual storage check
+        if x.storage().data_ptr() != tensors[0].storage().data_ptr():
+            return None
+        if x.stride() != tensors[0].stride():
+            return None
+        if x.storage_offset() != tensors[0].storage_offset() + i * final_stride[dim]:
+            return None
+    return tuple(final_stride)
+
+
+def efficient_stack(
+    tensors: Union[Tuple[torch.Tensor, ...], List[torch.Tensor]], dim: int
+) -> torch.Tensor:
+    strides = get_stack_strides(tensors, dim)
+    if strides is not None:
+        input_shape = list(tensors[0].shape)
+        input_shape.insert(dim, len(tensors))
+        return tensors[0].as_strided(input_shape, strides)
+    return torch.stack(tensors, dim=dim)
+
+
+class _Unbind(torch.autograd.Function):
+    """
+    Splits a packed `qkv` tensor into query, key and values.
+    The magic happens in the backward. We want to `torch.stack` the tensors
+    together, but we don't need to if the gradients have already the same storage
+    (and that is something that our attention operators support)
+    """
+
+    @staticmethod
+    # type: ignore
+    def forward(ctx, x: torch.Tensor, dim: int):
+        ctx.dim = dim
+        return x.unbind(dim)
+
+    @classmethod
+    # type: ignore
+    def backward(cls, ctx, *tensors: torch.Tensor):
+        return efficient_stack(tensors, ctx.dim), None
+
+
+def unbind(x: torch.Tensor, dim: int) -> Tuple[torch.Tensor, ...]:
+    return _Unbind.apply(x, dim)
 
 
 def memory_efficient_attention(

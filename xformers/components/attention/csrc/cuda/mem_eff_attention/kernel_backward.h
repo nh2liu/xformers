@@ -83,9 +83,9 @@ struct AttentionBackwardKernel {
     accum_t* delta_ptr; // [Mq, nH]
 
     // Output tensors
-    scalar_t* grad_query_ptr; //  [Mq, nH, K]
-    scalar_t* grad_key_ptr; //    [Mk, nH, K]
-    scalar_t* grad_value_ptr; //  [Mk, nH, Kv]
+    output_t* grad_query_ptr; //  [Mq, nH, K]
+    output_t* grad_key_ptr; //    [Mk, nH, K]
+    output_t* grad_value_ptr; //  [Mk, nH, Kv]
 
     // Dimensions/strides
     int32_t head_dim;
@@ -99,18 +99,19 @@ struct AttentionBackwardKernel {
     int32_t k_strideM;
     int32_t v_strideM;
     int32_t gO_strideM;
+    int8_t gQKV_strideM_multiplier; // 3 for packed, 1 otherwise
 
     CUTLASS_HOST_DEVICE int32_t o_strideM() const {
       return head_dim_value * num_heads;
     }
     CUTLASS_HOST_DEVICE int32_t gQ_strideM() const {
-      return num_heads * head_dim;
+      return gQKV_strideM_multiplier * num_heads * head_dim;
     }
     CUTLASS_HOST_DEVICE int32_t gK_strideM() const {
-      return num_heads * head_dim;
+      return gQKV_strideM_multiplier * num_heads * head_dim;
     }
     CUTLASS_HOST_DEVICE int32_t gV_strideM() const {
-      return num_heads * head_dim_value;
+      return gQKV_strideM_multiplier * num_heads * head_dim_value;
     }
 
     // Everything below is only used in `advance_to_block`
@@ -160,6 +161,7 @@ struct AttentionBackwardKernel {
       num_heads = warp_uniform(num_heads);
 
       gO_strideM = warp_uniform(gO_strideM);
+      gQKV_strideM_multiplier = warp_uniform(gQKV_strideM_multiplier);
       q_strideM = warp_uniform(q_strideM);
       k_strideM = warp_uniform(k_strideM);
       v_strideM = warp_uniform(v_strideM);
@@ -1415,12 +1417,14 @@ struct AttentionBackwardKernel {
     bool rowPred = (query_start + laneRow) < p.num_queries;
     bool pred = rowPred;
 
-    const __restrict__ AccessType* grad_output_ptr =
-        reinterpret_cast<const __restrict__ AccessType*>(
+    // on windows, previous syntax __restrict__ AccessType*
+    // resulted in error: "restrict" is not allowed
+    const AccessType* __restrict__ grad_output_ptr =
+        reinterpret_cast<const AccessType* __restrict__>(
             p.grad_output_ptr + (query_start + laneRow) * p.gO_strideM +
             laneFirstCol);
-    const __restrict__ AccessType* output_ptr =
-        reinterpret_cast<const __restrict__ AccessType*>(
+    const AccessType* __restrict__ output_ptr =
+        reinterpret_cast<const AccessType* __restrict__>(
             p.output_ptr + (query_start + laneRow) * p.o_strideM() +
             laneFirstCol);
 
