@@ -89,9 +89,7 @@ struct AttentionBackwardKernel {
     output_t* grad_key_ptr; //    [Mk, nH, K]
     output_t* grad_value_ptr; //  [Mk, nH, Kv]
     // Accumulators
-    output_accum_t* grad_query_accum_ptr = nullptr;
-    output_accum_t* grad_key_accum_ptr = nullptr;
-    output_accum_t* grad_value_accum_ptr = nullptr;
+    output_accum_t* gmem_storage = nullptr;
 
     // Dimensions/strides
     int32_t head_dim;
@@ -105,30 +103,19 @@ struct AttentionBackwardKernel {
     int32_t k_strideM;
     int32_t v_strideM;
     int32_t gO_strideM;
-    int32_t gQ_strideM_;
-    int32_t gK_strideM_;
-    int32_t gV_strideM_;
+    int8_t gQKV_strideM_multiplier; // 3 for packed, 1 otherwise
 
     CUTLASS_HOST_DEVICE int32_t o_strideM() const {
       return head_dim_value * num_heads;
     }
     CUTLASS_HOST_DEVICE int32_t gQ_strideM() const {
-      return gQ_strideM_;
-    }
-    CUTLASS_HOST_DEVICE int32_t gQ_accum_strideM() const {
-      return kNeedsAccumGradQ ? num_heads * head_dim : gQ_strideM();
+      return gQKV_strideM_multiplier * num_heads * head_dim;
     }
     CUTLASS_HOST_DEVICE int32_t gK_strideM() const {
-      return gK_strideM_;
-    }
-    CUTLASS_HOST_DEVICE int32_t gK_accum_strideM() const {
-      return kNeedsAccumGradK ? num_heads * head_dim : gK_strideM();
+      return gQKV_strideM_multiplier * num_heads * head_dim;
     }
     CUTLASS_HOST_DEVICE int32_t gV_strideM() const {
-      return gV_strideM_;
-    }
-    CUTLASS_HOST_DEVICE int32_t gV_accum_strideM() const {
-      return kNeedsAccumGradV ? num_heads * head_dim_value : gV_strideM();
+      return gQKV_strideM_multiplier * num_heads * head_dim_value;
     }
 
     // Everything below is only used in `advance_to_block`
@@ -200,6 +187,7 @@ struct AttentionBackwardKernel {
       num_heads = warp_uniform(num_heads);
 
       gO_strideM = warp_uniform(gO_strideM);
+      gQKV_strideM_multiplier = warp_uniform(gQKV_strideM_multiplier);
       q_strideM = warp_uniform(q_strideM);
       k_strideM = warp_uniform(k_strideM);
       v_strideM = warp_uniform(v_strideM);
@@ -216,9 +204,7 @@ struct AttentionBackwardKernel {
       grad_key_ptr = warp_uniform(grad_key_ptr);
       grad_value_ptr = warp_uniform(grad_value_ptr);
 
-      grad_query_accum_ptr = warp_uniform(grad_query_accum_ptr);
-      grad_key_accum_ptr = warp_uniform(grad_key_accum_ptr);
-      grad_value_accum_ptr = warp_uniform(grad_value_accum_ptr);
+      gmem_storage = warp_uniform(gmem_storage);
     }
 
     __host__ dim3 getBlocksGrid() const {
@@ -226,6 +212,20 @@ struct AttentionBackwardKernel {
     }
     __host__ dim3 getThreadsGrid() const {
       return dim3(kWarpSize, kNumWarpsPerBlock, 1);
+    }
+    __host__ size_t gmem_f32_elements() const {
+      // Returns number of f32 elements we need as buffer in gmem
+      size_t elements = 0;
+      if (Kernel::kNeedsAccumGradQ) {
+        elements += num_batches * num_queries * num_heads * head_dim;
+      }
+      if (Kernel::kNeedsAccumGradK) {
+        elements += num_batches * num_keys * num_heads * head_dim;
+      }
+      if (Kernel::kNeedsAccumGradV) {
+        elements += num_batches * num_keys * num_heads * head_dim_value;
+      }
+      return elements;
     }
   };
 
@@ -1532,12 +1532,14 @@ struct AttentionBackwardKernel {
     bool rowPred = (query_start + laneRow) < p.num_queries;
     bool pred = rowPred;
 
-    const __restrict__ AccessType* grad_output_ptr =
-        reinterpret_cast<const __restrict__ AccessType*>(
+    // on windows, previous syntax __restrict__ AccessType*
+    // resulted in error: "restrict" is not allowed
+    const AccessType* __restrict__ grad_output_ptr =
+        reinterpret_cast<const AccessType* __restrict__>(
             p.grad_output_ptr + (query_start + laneRow) * p.gO_strideM +
             laneFirstCol);
-    const __restrict__ AccessType* output_ptr =
-        reinterpret_cast<const __restrict__ AccessType*>(
+    const AccessType* __restrict__ output_ptr =
+        reinterpret_cast<const AccessType* __restrict__>(
             p.output_ptr + (query_start + laneRow) * p.o_strideM() +
             laneFirstCol);
 

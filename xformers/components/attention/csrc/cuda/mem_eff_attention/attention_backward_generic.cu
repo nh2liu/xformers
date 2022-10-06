@@ -103,10 +103,15 @@ mem_efficient_attention_backward_cutlass(
   // initialized
   bool grad_kv_needs_init = causal && N > M;
   at::Tensor grad_q, grad_k, grad_v;
-  at::Tensor grad_q_accum, grad_k_accum, grad_v_accum;
   if (!grad_kv_needs_init && query.size(1) == key.size(1) &&
-      query.size(3) == value.size(3)) {
+      query.size(3) == value.size(3) &&
+      query.storage().is_alias_of(key.storage()) &&
+      query.storage().is_alias_of(value.storage())) {
     // Create one big contiguous chunk
+    // This is because q, k and v usually come from a single
+    // output of a linear layer that is chunked.
+    // Creating the gradients with the right layout saves us
+    // a `torch.cat` call in the backward pass
     at::Tensor chunk = at::empty({B, M, 3, nH, K}, query.options());
     grad_q = chunk.select(2, 0);
     grad_k = chunk.select(2, 1);
@@ -116,6 +121,7 @@ mem_efficient_attention_backward_cutlass(
     grad_k = grad_kv_needs_init ? at::zeros_like(key) : at::empty_like(key);
     grad_v = grad_kv_needs_init ? at::zeros_like(value) : at::empty_like(value);
   }
+  at::Tensor gmem_storage;
 
   auto launchKernel = [&](auto _k, int computeCapability) {
     using Kernel = decltype(_k);
@@ -154,24 +160,6 @@ mem_efficient_attention_backward_cutlass(
     p.num_batches = B;
     p.num_heads = nH;
     p.causal = causal;
-    if (Kernel::kNeedsAccumGradQ) {
-      grad_q_accum = at::empty(
-          {B, M, nH, K}, query.options().dtype(at::ScalarType::Float));
-      p.grad_query_accum_ptr =
-          (typename Kernel::output_accum_t*)grad_q_accum.data_ptr();
-    }
-    if (Kernel::kNeedsAccumGradK) {
-      grad_k_accum = at::empty(
-          {B, Mkv, nH, K}, query.options().dtype(at::ScalarType::Float));
-      p.grad_key_accum_ptr =
-          (typename Kernel::output_accum_t*)grad_k_accum.data_ptr();
-    }
-    if (Kernel::kNeedsAccumGradV) {
-      grad_v_accum = at::empty(
-          {B, Mkv, nH, Kv}, query.options().dtype(at::ScalarType::Float));
-      p.grad_value_accum_ptr =
-          (typename Kernel::output_accum_t*)grad_v_accum.data_ptr();
-    }
 
     ASSIGN_CHECK_OVERFLOW(p.gO_strideB, grad_out.stride(0));
     ASSIGN_CHECK_OVERFLOW(p.gO_strideM, grad_out.stride(1));
@@ -183,12 +171,13 @@ mem_efficient_attention_backward_cutlass(
     ASSIGN_CHECK_OVERFLOW(p.gQ_strideB, grad_q.stride(0));
     ASSIGN_CHECK_OVERFLOW(p.gK_strideB, grad_k.stride(0));
     ASSIGN_CHECK_OVERFLOW(p.gV_strideB, grad_v.stride(0));
-    ASSIGN_CHECK_OVERFLOW(p.gQ_strideM_, grad_q.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.gK_strideM_, grad_k.stride(1));
-    ASSIGN_CHECK_OVERFLOW(p.gV_strideM_, grad_v.stride(1));
     ASSIGN_CHECK_OVERFLOW(p.gQ_strideH, grad_q.stride(2));
     ASSIGN_CHECK_OVERFLOW(p.gK_strideH, grad_k.stride(2));
     ASSIGN_CHECK_OVERFLOW(p.gV_strideH, grad_v.stride(2));
+    p.gQKV_strideM_multiplier = grad_q.is_contiguous() ? 1 : 3;
+    TORCH_INTERNAL_ASSERT(p.gQ_strideM() == grad_q.stride(1));
+    TORCH_INTERNAL_ASSERT(p.gK_strideM() == grad_k.stride(1));
+    TORCH_INTERNAL_ASSERT(p.gV_strideM() == grad_v.stride(1));
 
     ASSIGN_CHECK_OVERFLOW(p.q_strideB, query.stride(0));
     ASSIGN_CHECK_OVERFLOW(p.k_strideB, key.stride(0));
@@ -200,6 +189,11 @@ mem_efficient_attention_backward_cutlass(
     ASSIGN_CHECK_OVERFLOW(p.k_strideH, key.stride(2));
     ASSIGN_CHECK_OVERFLOW(p.v_strideH, value.stride(2));
 
+    size_t gmem_elements = p.gmem_f32_elements();
+    if (gmem_elements) {
+      gmem_storage = at::empty({gmem_storage}, query.options().dtype(at::ScalarType::Float));
+      p.gmem_storage = gmem_storage.data_ptr<float>();
+    }
     Kernel::check_supported(p);
 
     constexpr auto kernel_fn = attention_kernel_backward_batched<Kernel>;
@@ -212,6 +206,17 @@ mem_efficient_attention_backward_cutlass(
           kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
 
+    // second syntax resulted in the error below on windows
+    // error C3495: 'kernel_fn': a simple capture must be a variable
+    // with automatic storage duration declared
+    // in the reaching scope of the lambda
+#ifdef _WIN32
+    cudaFuncAttributes attr;
+    AT_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel_fn));
+    TORCH_INTERNAL_ASSERT(
+        attr.binaryVersion >= Kernel::ArchTag::kMinComputeCapability,
+        "Something went wrong in the build process");
+#else
     auto checkBinaryArchMatches = [&]() {
       cudaFuncAttributes attr;
       AT_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel_fn));
@@ -219,6 +224,7 @@ mem_efficient_attention_backward_cutlass(
     };
     TORCH_INTERNAL_ASSERT(
         checkBinaryArchMatches(), "Something went wrong in the build process");
+#endif
 
     kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes>>>(p);
   };
