@@ -266,11 +266,10 @@ class xFormer(torch.nn.Module):
         encoder_input_mask: Optional[torch.Tensor] = None,
         decoder_input_mask: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-
+        memory = src.clone()
         # Encode to latent space if encoder is present
         if len(list(self.encoders.parameters())) > 0:
             encoders = self.encoders
-            memory = src.clone()
             if isinstance(encoders, torch.nn.ModuleList):
                 for encoder in encoders:
                     memory = encoder(memory, input_mask=encoder_input_mask)
@@ -300,7 +299,6 @@ class xFormer(torch.nn.Module):
             for decoder in self.decoders:
                 tgt = decoder(
                     target=tgt,
-                    # pyre-fixme[61]: `memory` is not always initialized here.
                     memory=memory,
                     input_mask=decoder_input_mask,
                 )
